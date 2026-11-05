@@ -88,6 +88,7 @@ class CampaignControlsTests(unittest.TestCase):
             db.execute("INSERT INTO accounts(telegram_id,label,session,active) VALUES(1,'test','fake',1)")
             db.commit()
             set_state(db, "running", "1")
+            set_state(db, "channel_source_chat_id", "-1")
             client = FakeClient()
             async def resolve(*args):
                 return type("Recipient", (), {"user_id": 123})()

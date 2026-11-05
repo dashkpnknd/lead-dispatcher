@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+from telethon import utils
 from telethon.tl.types import InputPeerChannel
 
 from account_auth import client_for, finish_password, finish_phone, qr_login, request_code
@@ -185,7 +186,9 @@ def background_scan(api: BotAPI, chat_id: int, db_path: Path) -> None:
                     source = InputPeerChannel(int(channel_id), int(access_hash))
                 else:
                     source = int(channel) if channel.lstrip("-").isdigit() else channel
-                added, known = await scan_channel(client, source, db_path, None)
+                entity = await client.get_entity(source)
+                added, known = await scan_channel(client, entity, db_path, None)
+                set_state(db, "channel_source_chat_id", str(utils.get_peer_id(entity)))
                 return f"Сканирование завершено. Добавлено: {added}; уже были: {known}."
             finally:
                 await client.disconnect()
@@ -284,6 +287,7 @@ def handle_callback(api: BotAPI, callback: dict[str, Any], admin_chat_id: int,
             if channel in options:
                 set_state(db, "channel", "peer:" + channel)
                 set_state(db, "channel_label", options[channel])
+                set_state(db, "channel_source_chat_id", "")
                 reply(api, admin_chat_id, f"Канал выбран: {options[channel]}", MENU)
         elif data == "scan":
             reply(api, admin_chat_id, "Читаю канал от новых публикаций к старым. Пришлю результат.")
@@ -378,6 +382,7 @@ def handle_message(api: BotAPI, message: dict[str, Any], admin_chat_id: int,
                 channel = channel.replace("https://t.me/", "@", 1).split("/", 1)[0]
             set_state(db, "channel", channel)
             set_state(db, "channel_label", channel)
+            set_state(db, "channel_source_chat_id", "")
             set_state(db, "auth_stage", "")
             reply(api, chat_id, f"Канал выбран: {channel}", MENU)
             return

@@ -41,6 +41,8 @@ def start(db: sqlite3.Connection) -> str:
         return "Сначала подключите и выберите аккаунт."
     if not get_state(db, "channel"):
         return "Сначала укажите канал."
+    if not get_state(db, "channel_source_chat_id"):
+        return "Сначала просканируйте выбранный канал."
     set_state(db, "running", "1")
     set_state(db, "next_due", str(time.time()))
     return "Рассылка запущена."
@@ -63,10 +65,14 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
         if not account:
             set_state(db, "running", "0")
             return "Нет выбранного аккаунта; рассылка остановлена."
+        source_chat_id = int(get_state(db, "channel_source_chat_id", "0"))
+        if not source_chat_id:
+            set_state(db, "running", "0")
+            return "Канал не просканирован; рассылка остановлена."
         row = db.execute("""SELECT p.* FROM posts p LEFT JOIN deliveries d
             ON d.source_chat_id=p.source_chat_id AND d.source_message_id=p.source_message_id
-            WHERE p.status='ready' AND d.source_chat_id IS NULL
-            ORDER BY p.source_message_id DESC, p.source_chat_id DESC LIMIT 1""").fetchone()
+            WHERE p.status='ready' AND p.source_chat_id=? AND d.source_chat_id IS NULL
+            ORDER BY p.source_message_id DESC LIMIT 1""", (source_chat_id,)).fetchone()
         if not row:
             set_state(db, "running", "0")
             return "Очередь закончилась."
