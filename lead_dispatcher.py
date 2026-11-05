@@ -96,6 +96,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
         finished_at TEXT,
         PRIMARY KEY (source_chat_id, source_message_id)
     )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS report_events (
+        event_key TEXT PRIMARY KEY,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        delivered_at TEXT
+    )""")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(posts)")}
     if "reason" not in columns:
         connection.execute("ALTER TABLE posts ADD COLUMN reason TEXT")

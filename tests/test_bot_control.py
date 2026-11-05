@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bot_control import handle_message, load_offset, save_offset
+from campaign import get_state
 from lead_dispatcher import connect
 
 
@@ -35,6 +36,24 @@ class BotControlTests(unittest.TestCase):
             self.assertIsNone(load_offset(path))
             save_offset(path, 42)
             self.assertEqual(load_offset(path), 42)
+
+    def test_only_operator_can_bind_report_group(self):
+        api = FakeAPI()
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "queue.sqlite3"
+            group = {"chat": {"id": -10042, "type": "supergroup"},
+                     "text": "/reports_here@LeadDispatcherBot_bot"}
+            handle_message(api, {**group, "from": {"id": 222}}, 111,
+                           db_path, Path(directory) / "config.json")
+            db = connect(db_path)
+            self.assertEqual(get_state(db, "report_chat_id"), "")
+            db.close()
+            handle_message(api, {**group, "from": {"id": 111}}, 111,
+                           db_path, Path(directory) / "config.json")
+            db = connect(db_path)
+            self.assertEqual(get_state(db, "report_chat_id"), "-10042")
+            db.close()
+            self.assertEqual(api.messages, [(-10042, "📊 Отчёты будут здесь.")])
 
     def test_forwarded_photo_is_imported_without_lead_send(self):
         api = FakeAPI()

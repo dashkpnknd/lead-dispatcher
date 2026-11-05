@@ -19,10 +19,12 @@ from telethon.tl.types import InputPeerChannel
 from account_auth import client_for, finish_password, finish_phone, qr_login, request_code
 from campaign import get_state, pause, send_test_to_operator, sending_allowed, set_state, start, tick
 from lead_dispatcher import bot_download_photo, connect, import_posts, posts_from_updates
+from reporting import deliver_pending
 from telegram_adapter import scan_channel
 
 LOG = logging.getLogger(__name__)
-HELP = "ЛидДиспетчер. Отправка лидам выключена. Выберите действие:"
+HELP = ("ЛидДиспетчер. Отправка лидам выключена. Выберите действие. "
+        "Для отчётов отправьте /reports_here в нужной группе от имени оператора.")
 MENU = [[("👤 Аккаунты", "accounts"), ("📢 Канал", "channels")],
         [("🔎 Сканировать", "scan"), ("📋 Очередь", "queue")],
         [("🧪 Тест себе", "test_send")],
@@ -83,7 +85,9 @@ def reply(api: BotAPI, chat_id: int, text: str,
 def queue_counts(db_path: Path) -> tuple[int, int]:
     db = connect(db_path)
     try:
-        counts = {r[0]: r[1] for r in db.execute("SELECT status,COUNT(*) FROM posts GROUP BY status")}
+        source = get_state(db, "channel_source_chat_id")
+        counts = {r[0]: r[1] for r in db.execute(
+            "SELECT status,COUNT(*) FROM posts WHERE source_chat_id=? GROUP BY status", (source,))}
         return counts.get("ready", 0), counts.get("unresolved", 0)
     finally:
         db.close()
@@ -92,11 +96,12 @@ def queue_counts(db_path: Path) -> tuple[int, int]:
 def preview_text(db_path: Path, config_path: Path) -> str:
     db = connect(db_path)
     try:
+        source = get_state(db, "channel_source_chat_id")
         rows = db.execute("""SELECT p.source_message_id,p.identifier_value FROM posts p
             LEFT JOIN deliveries d ON d.source_chat_id=p.source_chat_id
               AND d.source_message_id=p.source_message_id
-            WHERE p.status='ready' AND d.source_chat_id IS NULL
-            ORDER BY p.source_message_id DESC,p.source_chat_id DESC LIMIT 5""").fetchall()
+            WHERE p.status='ready' AND p.source_chat_id=? AND d.source_chat_id IS NULL
+            ORDER BY p.source_message_id DESC LIMIT 5""", (source,)).fetchall()
         return ("Следующие карточки:\n" + "\n".join(
             f"#{r[0]} · {r[1]} · фото сохранено" for r in rows)) if rows else (
             "В очереди пока нет новых подготовленных постов.")
@@ -107,15 +112,21 @@ def preview_text(db_path: Path, config_path: Path) -> str:
 def status_text(db: sqlite3.Connection) -> str:
     account = db.execute("SELECT label FROM accounts WHERE active=1").fetchone()
     channel = get_state(db, "channel_label") or get_state(db, "channel") or "не выбран"
+    source = get_state(db, "channel_source_chat_id")
     ready = db.execute("""SELECT COUNT(*) FROM posts p LEFT JOIN deliveries d
         ON d.source_chat_id=p.source_chat_id AND d.source_message_id=p.source_message_id
-        WHERE p.status='ready' AND d.source_chat_id IS NULL""").fetchone()[0]
-    unresolved = db.execute("SELECT COUNT(*) FROM posts WHERE status='unresolved'").fetchone()[0]
-    sent = db.execute("SELECT COUNT(*) FROM deliveries WHERE status='sent'").fetchone()[0]
-    review = db.execute("SELECT COUNT(*) FROM deliveries WHERE status IN ('sending','failed')").fetchone()[0]
+        WHERE p.status='ready' AND p.source_chat_id=? AND d.source_chat_id IS NULL""",
+        (source,)).fetchone()[0]
+    unresolved = db.execute("SELECT COUNT(*) FROM posts WHERE source_chat_id=? AND status='unresolved'",
+                            (source,)).fetchone()[0]
+    sent = db.execute("SELECT COUNT(*) FROM deliveries WHERE source_chat_id=? AND status='sent'",
+                      (source,)).fetchone()[0]
+    review = db.execute("SELECT COUNT(*) FROM deliveries WHERE source_chat_id=? "
+                        "AND status IN ('sending','failed')", (source,)).fetchone()[0]
     mode = "работает" if get_state(db, "running") == "1" and sending_allowed() else "на паузе"
+    reports = "подключены" if get_state(db, "report_chat_id") else "не подключены"
     return (f"Рассылка: {mode}. Отправка с сервера: {'разрешена' if sending_allowed() else 'выключена'}.\n"
-            f"Аккаунт: {account[0] if account else 'не выбран'}\nКанал: {channel}\n"
+            f"Аккаунт: {account[0] if account else 'не выбран'}\nКанал: {channel}\nОтчёты: {reports}.\n"
             f"Готово: {ready}; ненайденные: {unresolved}; отправлено: {sent}; проверить: {review}.")
 
 
@@ -328,11 +339,22 @@ def _delete_sensitive(api: BotAPI, chat_id: int, message: dict) -> None:
 
 def handle_message(api: BotAPI, message: dict[str, Any], admin_chat_id: int,
                    db_path: Path, config_path: Path) -> None:
-    chat_id = (message.get("chat") or {}).get("id")
-    if chat_id != admin_chat_id or (message.get("from") or {}).get("id") != admin_chat_id:
-        return
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    sender_id = (message.get("from") or {}).get("id")
     text = (message.get("text") or "").strip()
     command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+    if (sender_id == admin_chat_id and chat.get("type") in ("group", "supergroup")
+            and command == "/reports_here"):
+        db = connect(db_path)
+        try:
+            set_state(db, "report_chat_id", str(chat_id))
+            reply(api, chat_id, "📊 Отчёты будут здесь.")
+        finally:
+            db.close()
+        return
+    if chat_id != admin_chat_id or (message.get("from") or {}).get("id") != admin_chat_id:
+        return
     db = connect(db_path)
     try:
         if command == "/cancel":
@@ -421,6 +443,20 @@ def save_offset(path: Path, offset: int) -> None:
     temporary.replace(path)
 
 
+def flush_reports(api: BotAPI, db_path: Path) -> bool:
+    db = connect(db_path)
+    try:
+        report_chat_id = get_state(db, "report_chat_id")
+        if report_chat_id:
+            deliver_pending(db, int(report_chat_id), api.send_message, limit=10)
+            return not db.execute(
+                "SELECT 1 FROM report_events WHERE delivered_at IS NULL LIMIT 1"
+            ).fetchone()
+        return True
+    finally:
+        db.close()
+
+
 def run() -> None:
     os.umask(0o077)
     token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -441,9 +477,12 @@ def run() -> None:
                     handle_callback(api, update["callback_query"], admin_chat_id, db_path, config_path)
                 offset = update["update_id"] + 1
                 save_offset(offset_path, offset)
+            if not flush_reports(api, db_path):
+                continue
             notice = tick(db_path, config_path)
             if notice:
                 reply(api, admin_chat_id, notice, MENU)
+            flush_reports(api, db_path)
         except Exception:
             LOG.exception("Bot polling failed; retrying")
             time.sleep(5)

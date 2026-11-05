@@ -33,6 +33,14 @@ class CampaignControlsTests(unittest.TestCase):
                 self.assertIsNone(tick(db_path, Path(directory) / "config.json"))
             db.close()
 
+    def test_start_requires_report_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = connect(Path(directory) / "queue.sqlite3")
+            with patch.dict(os.environ, {"LEAD_DISPATCHER_ALLOW_SEND": "1"}):
+                self.assertIn("группу отчётов", start(db))
+                self.assertEqual(get_state(db, "running"), "")
+            db.close()
+
     def test_admin_account_menu_and_nonadmin_callback(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "queue.sqlite3"
@@ -98,12 +106,69 @@ class CampaignControlsTests(unittest.TestCase):
                  patch("campaign.resolve_identifier", side_effect=resolve):
                 notice = tick(db_path, config)
                 self.assertIn("отправлена", notice)
-                self.assertIsNone(tick(db_path, config))
+                self.assertIn("Очередь закончилась", tick(db_path, config))
             self.assertEqual([event[0] for event in client.events], ["photo", "text"])
             self.assertEqual(client.events[1][2], "Вы тут на связи?")
             row = db.execute("SELECT status,first_message_id,second_message_id "
                              "FROM deliveries").fetchone()
             self.assertEqual(tuple(row), ("sent", 101, 102))
+            report = db.execute("SELECT body FROM report_events").fetchone()[0]
+            self.assertIn("@sample_user_123", report)
+            self.assertIn("Всего отправлено: 1", report)
+            db.close()
+
+    def test_unfound_recipient_and_final_reason_list_are_queued(self):
+        class FakeClient:
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "queue.sqlite3"
+            config = root / "config.json"
+            config.write_text('{"first_messages":["a","b","c"],'
+                              '"second_message":"hello",'
+                              '"pause_min_minutes":50,"pause_max_minutes":70}')
+            photo = root / "card.jpg"
+            photo.write_bytes(b"image")
+            db = connect(db_path)
+            import_posts(db, [{"source_chat_id": -1, "source_message_id": 8,
+                               "caption": "@missing_user", "photo_path": str(photo)},
+                              {"source_chat_id": -1, "source_message_id": 6,
+                               "caption": "@channel_example", "photo_path": str(photo)},
+                              {"source_chat_id": -1, "source_message_id": 7,
+                               "caption": "контакт не указан", "photo_path": str(photo)}])
+            db.execute("INSERT INTO accounts(telegram_id,label,session,active) VALUES(1,'test','fake',1)")
+            db.commit()
+            set_state(db, "running", "1")
+            set_state(db, "channel_source_chat_id", "-1")
+            set_state(db, "campaign_run_id", "run-1")
+
+            async def resolve(_client, identifier, _gate):
+                return None if identifier.value == "@missing_user" else object()
+
+            with patch.dict(os.environ, {"LEAD_DISPATCHER_ALLOW_SEND": "1"}), \
+                 patch("campaign.client_for", return_value=FakeClient()), \
+                 patch("campaign.resolve_identifier", side_effect=resolve):
+                self.assertIn("Не найден", tick(db_path, config))
+                self.assertIn("не является пользователем", tick(db_path, config))
+                self.assertIn("Очередь закончилась", tick(db_path, config))
+            bodies = [row[0] for row in db.execute(
+                "SELECT body FROM report_events ORDER BY rowid")]
+            self.assertIn("@missing_user", bodies[0])
+            self.assertIn("Всего отправлено: 0", bodies[0])
+            self.assertIn("Адресат не пользователь", bodies[1])
+            self.assertIn("Пропущено: 3", bodies[2])
+            self.assertTrue(any("Пользователь не найден" in body for body in bodies[3:]))
+            self.assertTrue(any("Адресат не пользователь" in body for body in bodies[3:]))
+            self.assertTrue(any("Контакт не указан" in body for body in bodies[3:]))
+            self.assertEqual(get_state(db, "running"), "0")
             db.close()
 
     def test_sample_is_sent_only_to_configured_operator(self):

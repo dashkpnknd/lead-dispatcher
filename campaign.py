@@ -10,12 +10,14 @@ import os
 import random
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 
 from telethon.errors import FloodWaitError
 
 from account_auth import client_for
 from lead_dispatcher import Identifier, connect, load_config
+from reporting import queue_card_report, queue_final_reports
 from telegram_adapter import PhoneLookupGate, resolve_identifier
 
 
@@ -37,14 +39,27 @@ def sending_allowed() -> bool:
 def start(db: sqlite3.Connection) -> str:
     if not sending_allowed():
         return "Отправка лидам закрыта на сервере. Сейчас доступны авторизация, сканирование и проверка очереди."
+    if get_state(db, "running") == "1":
+        return "Рассылка уже запущена."
+    if not get_state(db, "report_chat_id"):
+        return "Сначала привяжите группу отчётов командой /reports_here в группе."
     if not db.execute("SELECT 1 FROM accounts WHERE active=1").fetchone():
         return "Сначала подключите и выберите аккаунт."
     if not get_state(db, "channel"):
         return "Сначала укажите канал."
     if not get_state(db, "channel_source_chat_id"):
         return "Сначала просканируйте выбранный канал."
-    set_state(db, "running", "1")
-    set_state(db, "next_due", str(time.time()))
+    source_chat_id = get_state(db, "channel_source_chat_id")
+    if not db.execute("""SELECT 1 FROM posts p LEFT JOIN deliveries d
+        ON d.source_chat_id=p.source_chat_id AND d.source_message_id=p.source_message_id
+        WHERE p.source_chat_id=? AND p.status='ready' AND d.source_chat_id IS NULL
+        LIMIT 1""", (source_chat_id,)).fetchone():
+        return "В очереди нет карточек для отправки."
+    for key, value in (("running", "1"), ("next_due", str(time.time())),
+                       ("campaign_run_id", uuid.uuid4().hex)):
+        db.execute("INSERT INTO operator_state(key,value) VALUES(?,?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    db.commit()
     return "Рассылка запущена."
 
 
@@ -59,8 +74,6 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
     try:
         if not sending_allowed() or get_state(db, "running") != "1":
             return None
-        if time.time() < float(get_state(db, "next_due", "0")):
-            return None
         account = db.execute("SELECT * FROM accounts WHERE active=1 LIMIT 1").fetchone()
         if not account:
             set_state(db, "running", "0")
@@ -74,13 +87,19 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
             WHERE p.status='ready' AND p.source_chat_id=? AND d.source_chat_id IS NULL
             ORDER BY p.source_message_id DESC LIMIT 1""", (source_chat_id,)).fetchone()
         if not row:
-            set_state(db, "running", "0")
+            queue_final_reports(db, source_chat_id, get_state(db, "campaign_run_id", "legacy"))
+            db.execute("INSERT INTO operator_state(key,value) VALUES('running','0') "
+                       "ON CONFLICT(key) DO UPDATE SET value='0'")
+            db.commit()
             return "Очередь закончилась."
+        if time.time() < float(get_state(db, "next_due", "0")):
+            return None
         source = (row["source_chat_id"], row["source_message_id"])
         photo = row["photo_path"]
         if not photo or not Path(photo).is_file():
             db.execute("UPDATE posts SET status='unresolved',reason='photo_missing' "
                        "WHERE source_chat_id=? AND source_message_id=?", source)
+            queue_card_report(db, *source, row["identifier_value"], "photo_missing")
             db.commit()
             return "Одна карточка пропущена: фото не найдено."
         client = client_for(account["session"])
@@ -94,14 +113,22 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
             if recipient is None:
                 db.execute("UPDATE posts SET status='unresolved',reason='recipient_not_found' "
                            "WHERE source_chat_id=? AND source_message_id=?", source)
+                queue_card_report(db, *source, row["identifier_value"], "recipient_not_found")
                 db.commit()
                 return f"Не найден адресат карточки #{source[1]}."
             recipient_id = getattr(recipient, "user_id", None)
+            if recipient_id is None:
+                db.execute("UPDATE posts SET status='unresolved',reason='recipient_not_user' "
+                           "WHERE source_chat_id=? AND source_message_id=?", source)
+                queue_card_report(db, *source, row["identifier_value"], "recipient_not_user")
+                db.commit()
+                return f"Адресат карточки #{source[1]} не является пользователем."
             duplicate = db.execute("""SELECT 1 FROM deliveries WHERE recipient_id=?
                 AND status IN ('sending','sent') LIMIT 1""", (recipient_id,)).fetchone()
             if duplicate:
                 db.execute("UPDATE posts SET status='unresolved',reason='duplicate_recipient' "
                            "WHERE source_chat_id=? AND source_message_id=?", source)
+                queue_card_report(db, *source, row["identifier_value"], "duplicate_recipient")
                 db.commit()
                 return f"Карточка #{source[1]} пропущена: адресат уже обработан."
             db.execute("""INSERT INTO deliveries
@@ -118,6 +145,7 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
                 db.execute("""UPDATE deliveries SET second_message_id=?,status='sent',
                     finished_at=CURRENT_TIMESTAMP WHERE source_chat_id=? AND source_message_id=?""",
                            (second_sent.id, *source))
+                queue_card_report(db, *source, row["identifier_value"], "sent")
                 db.commit()
                 minutes = random.uniform(config["pause_min_minutes"], config["pause_max_minutes"])
                 set_state(db, "next_due", str(time.time() + minutes * 60))
@@ -126,6 +154,8 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
                 db.execute("""UPDATE deliveries SET status='failed',error=?,
                     finished_at=CURRENT_TIMESTAMP WHERE source_chat_id=? AND source_message_id=?""",
                            (type(exc).__name__, *source))
+                queue_card_report(db, *source, row["identifier_value"],
+                                  "delivery_failed", type(exc).__name__)
                 db.commit()
                 set_state(db, "running", "0")
                 return f"Ошибка отправки карточки #{source[1]} ({type(exc).__name__}); рассылка остановлена."
