@@ -71,7 +71,42 @@ def connect(db_path: Path) -> sqlite3.Connection:
             PRIMARY KEY (source_chat_id, source_message_id)
         )"""
     )
+    connection.execute("""CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        phone TEXT,
+        username TEXT,
+        session TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 0
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS operator_state (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS deliveries (
+        source_chat_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL,
+        account_id INTEGER NOT NULL,
+        recipient_id INTEGER,
+        first_message_id INTEGER,
+        second_message_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'sending',
+        error TEXT,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT,
+        PRIMARY KEY (source_chat_id, source_message_id)
+    )""")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(posts)")}
+    if "reason" not in columns:
+        connection.execute("ALTER TABLE posts ADD COLUMN reason TEXT")
+    delivery_columns = {row[1] for row in connection.execute("PRAGMA table_info(deliveries)")}
+    if "status" not in delivery_columns:
+        connection.execute("ALTER TABLE deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'sending'")
     connection.commit()
+    try:
+        os.chmod(db_path, 0o600)
+    except OSError:
+        pass
     return connection
 
 
