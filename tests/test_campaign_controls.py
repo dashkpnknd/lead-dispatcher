@@ -5,7 +5,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bot_control import handle_callback, keyboard
-from campaign import get_state, set_state, start, tick
+from campaign import get_state, send_test_to_operator, set_state, start, tick
+import asyncio
 from lead_dispatcher import connect, import_posts
 
 
@@ -104,6 +105,54 @@ class CampaignControlsTests(unittest.TestCase):
                              "FROM deliveries").fetchone()
             self.assertEqual(tuple(row), ("sent", 101, 102))
             db.close()
+
+    def test_sample_is_sent_only_to_configured_operator(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return True
+
+            async def get_input_entity(self, name):
+                self.calls.append(("resolve", name))
+                return name
+
+            async def send_file(self, recipient, photo, caption):
+                self.calls.append(("photo", recipient, photo, caption))
+
+            async def send_message(self, recipient, text):
+                self.calls.append(("text", recipient, text))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "queue.sqlite3"
+            config = root / "config.json"
+            config.write_text('{"first_messages":["a","b","c"],'
+                              '"second_message":"Вы тут на связи?"}')
+            photo = root / "test.jpg"
+            photo.write_bytes(b"test")
+            db = connect(db_path)
+            import_posts(db, [{"source_chat_id": 111, "source_message_id": 9,
+                               "caption": "@lead_should_not_receive", "photo_path": str(photo)}])
+            db.execute("INSERT INTO accounts(telegram_id,label,session,active) VALUES(1,'test','fake',1)")
+            db.commit()
+            db.close()
+            client = FakeClient()
+            with patch.dict(os.environ, {"LEAD_DISPATCHER_TEST_RECIPIENT": "@pnkvd",
+                                          "LEAD_DISPATCHER_ALLOW_SEND": "0"}), \
+                 patch("campaign.client_for", return_value=client):
+                answer = asyncio.run(send_test_to_operator(db_path, config, 111))
+            self.assertIn("@pnkvd", answer)
+            self.assertEqual(client.calls[0], ("resolve", "@pnkvd"))
+            self.assertEqual(client.calls[1][1], "@pnkvd")
+            self.assertEqual(client.calls[2][1], "@pnkvd")
 
 
 if __name__ == "__main__":

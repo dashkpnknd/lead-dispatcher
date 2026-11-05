@@ -17,7 +17,7 @@ from telethon import utils
 from telethon.tl.types import InputPeerChannel
 
 from account_auth import client_for, finish_password, finish_phone, qr_login, request_code
-from campaign import get_state, pause, sending_allowed, set_state, start, tick
+from campaign import get_state, pause, send_test_to_operator, sending_allowed, set_state, start, tick
 from lead_dispatcher import bot_download_photo, connect, import_posts, posts_from_updates
 from telegram_adapter import scan_channel
 
@@ -25,6 +25,7 @@ LOG = logging.getLogger(__name__)
 HELP = "ЛидДиспетчер. Отправка лидам выключена. Выберите действие:"
 MENU = [[("👤 Аккаунты", "accounts"), ("📢 Канал", "channels")],
         [("🔎 Сканировать", "scan"), ("📋 Очередь", "queue")],
+        [("🧪 Тест себе", "test_send")],
         [("❔ Ненайденные", "unresolved"), ("⏸ Пауза", "pause")],
         [("▶️ Запуск", "start_campaign")]]
 
@@ -292,6 +293,12 @@ def handle_callback(api: BotAPI, callback: dict[str, Any], admin_chat_id: int,
         elif data == "scan":
             reply(api, admin_chat_id, "Читаю канал от новых публикаций к старым. Пришлю результат.")
             threading.Thread(target=background_scan, args=(api, admin_chat_id, db_path), daemon=True).start()
+        elif data == "test_send":
+            reply(api, admin_chat_id, "Отправить одну пересланную тестовую карточку и два сообщения на @pnkvd?", [
+                [("Да, отправить тест", "test_send_confirm"), ("Отмена", "menu")]])
+        elif data == "test_send_confirm":
+            answer = asyncio.run(send_test_to_operator(db_path, config_path, admin_chat_id))
+            reply(api, admin_chat_id, answer, MENU)
         elif data == "queue":
             reply(api, admin_chat_id, status_text(db) + "\n\n" + preview_text(db_path, config_path), MENU)
         elif data == "unresolved":

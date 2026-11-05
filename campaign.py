@@ -145,3 +145,34 @@ def tick(db_path: Path, config_path: Path) -> str | None:
     if not sending_allowed():
         return None
     return asyncio.run(_deliver(db_path, config_path))
+
+
+async def send_test_to_operator(db_path: Path, config_path: Path, operator_chat_id: int) -> str:
+    """Send one forwarded sample to the configured operator, never to its caption contact."""
+    recipient_name = os.environ.get("LEAD_DISPATCHER_TEST_RECIPIENT", "")
+    if not recipient_name.startswith("@"):
+        return "Тестовый адресат не настроен на сервере."
+    db = connect(db_path)
+    try:
+        account = db.execute("SELECT session FROM accounts WHERE active=1").fetchone()
+        if not account:
+            return "Сначала подключите и выберите рабочий аккаунт."
+        row = db.execute("""SELECT photo_path FROM posts WHERE source_chat_id=?
+            AND photo_path IS NOT NULL ORDER BY source_message_id DESC LIMIT 1""",
+            (operator_chat_id,)).fetchone()
+        if not row or not Path(row[0]).is_file():
+            return "Нет пересланной тестовой карточки с сохранённым фото."
+        client = client_for(account[0])
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                return "Сессия аккаунта истекла; войдите заново."
+            recipient = await client.get_input_entity(recipient_name)
+            config = load_config(config_path)
+            await client.send_file(recipient, row[0], caption=random.choice(config["first_messages"]))
+            await client.send_message(recipient, config["second_message"])
+            return f"Тестовая пара отправлена {recipient_name}."
+        finally:
+            await client.disconnect()
+    finally:
+        db.close()
