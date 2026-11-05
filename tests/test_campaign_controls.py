@@ -1,11 +1,12 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from bot_control import handle_callback, keyboard
-from campaign import get_state, send_test_to_operator, set_state, start, tick
+from campaign import first_message_for_time, get_state, send_test_to_operator, set_state, start, tick
 import asyncio
 from lead_dispatcher import connect, import_posts
 
@@ -23,6 +24,20 @@ class FakeAPI:
 
 
 class CampaignControlsTests(unittest.TestCase):
+    def test_first_message_greeting_uses_moscow_time_boundaries(self):
+        config = {"first_messages": ["Добрый день, тест"]}
+        cases = (
+            (datetime(2026, 11, 5, 0, 59, tzinfo=timezone.utc), "Добрый вечер"),
+            (datetime(2026, 11, 5, 1, 0, tzinfo=timezone.utc), "Доброе утро"),
+            (datetime(2026, 11, 5, 7, 59, tzinfo=timezone.utc), "Доброе утро"),
+            (datetime(2026, 11, 5, 8, 0, tzinfo=timezone.utc), "Добрый день"),
+            (datetime(2026, 11, 5, 14, 59, tzinfo=timezone.utc), "Добрый день"),
+            (datetime(2026, 11, 5, 15, 0, tzinfo=timezone.utc), "Добрый вечер"),
+        )
+        for moment, expected in cases:
+            with self.subTest(moment=moment):
+                self.assertEqual(first_message_for_time(config, moment), expected + ", тест")
+
     def test_server_gate_refuses_start_and_tick(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "queue.sqlite3"

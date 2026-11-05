@@ -11,7 +11,9 @@ import random
 import sqlite3
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from telethon.errors import FloodWaitError
 
@@ -34,6 +36,22 @@ def set_state(db: sqlite3.Connection, key: str, value: str) -> None:
 
 def sending_allowed() -> bool:
     return os.environ.get("LEAD_DISPATCHER_ALLOW_SEND") == "1"
+
+
+def first_message_for_time(config: dict, now: datetime | None = None) -> str:
+    """Choose a first message with the greeting for Moscow local time."""
+    moscow = ZoneInfo("Europe/Moscow")
+    local_time = now.astimezone(moscow) if now else datetime.now(moscow)
+    message = random.choice(config["first_messages"])
+    if not message.startswith("Добрый день"):
+        return message
+    if 4 <= local_time.hour < 11:
+        greeting = "Доброе утро"
+    elif 11 <= local_time.hour < 18:
+        greeting = "Добрый день"
+    else:
+        greeting = "Добрый вечер"
+    return greeting + message[len("Добрый день"):]
 
 
 def start(db: sqlite3.Connection) -> str:
@@ -136,7 +154,7 @@ async def _deliver(db_path: Path, config_path: Path) -> str | None:
                 VALUES(?,?,?,?, 'sending')""", (*source, account["id"], recipient_id))
             db.commit()  # Crash after this point requires operator review, not an automatic resend.
             try:
-                first = random.choice(config["first_messages"])
+                first = first_message_for_time(config)
                 first_sent = await client.send_file(recipient, photo, caption=first)
                 db.execute("UPDATE deliveries SET first_message_id=? WHERE source_chat_id=? "
                            "AND source_message_id=?", (first_sent.id, *source))
@@ -199,7 +217,7 @@ async def send_test_to_operator(db_path: Path, config_path: Path, operator_chat_
                 return "Сессия аккаунта истекла; войдите заново."
             recipient = await client.get_input_entity(recipient_name)
             config = load_config(config_path)
-            await client.send_file(recipient, row[0], caption=random.choice(config["first_messages"]))
+            await client.send_file(recipient, row[0], caption=first_message_for_time(config))
             await client.send_message(recipient, config["second_message"])
             return f"Тестовая пара отправлена {recipient_name}."
         finally:
