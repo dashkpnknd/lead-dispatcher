@@ -51,3 +51,7 @@ export LEAD_DISPATCHER_CONFIG='config.example.json'
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+## Связи и границы проекта
+
+Бот читает карточки лидов из Telegram-канала, ищет адресата по `@username` или телефону, ставит отправку в очередь и доставляет карточку через рабочий аккаунт. Заявки на вступление в каналы обрабатывает отдельный `tg-auto-approve-bot`.
